@@ -45,8 +45,10 @@ struct Asset {
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("update") => update(),
+        Some("install") => install(),
+        Some("uninstall") => service::uninstall(),
         Some("keep") => keep(),
-        _ => bail!("usage: tines update | keep"),
+        _ => bail!("usage: tines update | install | uninstall | keep"),
     }
 }
 
@@ -70,7 +72,7 @@ fn update() -> Result<()> {
     if installed.as_deref() == Some(latest) {
         println!("letmeknow {latest} is current");
     } else {
-        install(&release, "letmeknow", &LETMEKNOW_EXES, &bin)?;
+        fetch(&release, "letmeknow", &LETMEKNOW_EXES, &bin)?;
         println!("letmeknow {} → {latest}", installed.as_deref().unwrap_or("none"));
     }
 
@@ -78,7 +80,7 @@ fn update() -> Result<()> {
     let running = env!("CARGO_PKG_VERSION");
     let latest = &release.tag_name[1..];
     if version(latest) > version(running) || !bin.join(exe("tines")).exists() {
-        install(&release, "tines", &["tines"], &bin)?;
+        fetch(&release, "tines", &["tines"], &bin)?;
         println!("tines {running} → {latest}");
     } else {
         println!("tines {running} is current");
@@ -95,7 +97,7 @@ fn keep() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let me = std::env::current_exe()?;
     let built = std::fs::metadata(&me)?.modified()?;
-    group::stop_on_signals();
+    group::init();
     let mut short: u32 = 0;
     loop {
         if std::fs::metadata(&me)?.modified()? != built {
@@ -118,6 +120,121 @@ fn keep() -> Result<()> {
         if group::stopping() {
             return log(&home, "stopped");
         }
+    }
+}
+
+/// Has the system run `tines keep` from `~/.tines/bin` from now on, and again after it restarts, with the PATH this
+/// command runs with, which Pi and its tools need.
+fn install() -> Result<()> {
+    let tines = home()?.join("bin").join(exe("tines"));
+    ensure!(tines.exists(), "{} does not exist: run tines update first", tines.display());
+    service::install(&tines, &std::env::var("PATH")?)
+}
+
+/// A systemd user service, which runs without a login once the user lingers.
+#[cfg(target_os = "linux")]
+mod service {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use anyhow::{Context, Result};
+
+    pub fn install(tines: &Path, path: &str) -> Result<()> {
+        let text = format!(
+            "[Unit]\nDescription=tines: this machine's tine\n\n[Service]\nExecStart=\"{}\" keep\nEnvironment=\"PATH={path}\"\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
+            tines.display()
+        );
+        let file = unit()?;
+        std::fs::create_dir_all(file.parent().context("no parent")?)?;
+        std::fs::write(&file, text)?;
+        super::run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        super::run(Command::new("systemctl").args(["--user", "enable", "tines"]))?;
+        super::run(Command::new("systemctl").args(["--user", "restart", "tines"]))?;
+        super::run(Command::new("loginctl").arg("enable-linger"))
+    }
+
+    pub fn uninstall() -> Result<()> {
+        super::run(Command::new("systemctl").args(["--user", "disable", "--now", "tines"]))?;
+        std::fs::remove_file(unit()?)?;
+        super::run(Command::new("systemctl").args(["--user", "daemon-reload"]))
+    }
+
+    fn unit() -> Result<PathBuf> {
+        let config = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(config) => PathBuf::from(config),
+            None => std::env::home_dir().context("no home directory")?.join(".config"),
+        };
+        Ok(config.join("systemd/user/tines.service"))
+    }
+}
+
+/// A launchd agent of the user's, which runs while the user is logged in.
+#[cfg(target_os = "macos")]
+mod service {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use anyhow::{Context, Result};
+
+    pub fn install(tines: &Path, path: &str) -> Result<()> {
+        let log = super::home()?.join("keep.log");
+        let text = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>tines</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>keep</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+            tines.display(),
+            log.display()
+        );
+        let file = plist()?;
+        std::fs::create_dir_all(file.parent().context("no parent")?)?;
+        std::fs::write(&file, text)?;
+        // An agent loaded already is replaced; one that is not makes bootout fail, which is fine.
+        let _ = Command::new("launchctl").args(["bootout", &format!("{}/tines", domain())]).output();
+        super::run(Command::new("launchctl").args(["bootstrap", &domain()]).arg(&file))
+    }
+
+    pub fn uninstall() -> Result<()> {
+        super::run(Command::new("launchctl").args(["bootout", &format!("{}/tines", domain())]))?;
+        Ok(std::fs::remove_file(plist()?)?)
+    }
+
+    fn domain() -> String {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+
+    fn plist() -> Result<PathBuf> {
+        Ok(std::env::home_dir().context("no home directory")?.join("Library/LaunchAgents/tines.plist"))
+    }
+}
+
+/// A scheduled task that starts when the user logs in. It takes the user's own PATH, not this command's.
+#[cfg(windows)]
+mod service {
+    use std::path::Path;
+    use std::process::Command;
+
+    use anyhow::Result;
+
+    pub fn install(tines: &Path, _path: &str) -> Result<()> {
+        let task = format!("\"{}\" keep", tines.display());
+        super::run(Command::new("schtasks").args(["/Create", "/F", "/TN", "tines", "/SC", "ONLOGON", "/TR", &task]))?;
+        super::run(Command::new("schtasks").args(["/Run", "/TN", "tines"]))
+    }
+
+    pub fn uninstall() -> Result<()> {
+        // A task that does not run makes /End fail, which is fine.
+        let _ = Command::new("schtasks").args(["/End", "/TN", "tines"]).output();
+        super::run(Command::new("schtasks").args(["/Delete", "/F", "/TN", "tines"]))
     }
 }
 
@@ -181,7 +298,7 @@ mod group {
     }
 
     /// From now on SIGTERM, SIGINT and SIGHUP tell the keeper to stop, which it does once it ended Pi's processes.
-    pub fn stop_on_signals() {
+    pub fn init() {
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             unsafe { libc::signal(signal, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
         }
@@ -220,14 +337,23 @@ mod group {
 #[cfg(windows)]
 mod group {
     use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::process::{Child, Command};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
-    pub fn stop_on_signals() {}
+    /// Lets go of a console that is the keeper's alone, as the scheduled task gives it, which closes its window.
+    pub fn init() {
+        let mut processes = [0u32; 2];
+        if unsafe { GetConsoleProcessList(processes.as_mut_ptr(), 2) } == 1 {
+            unsafe { FreeConsole() };
+        }
+    }
 
     pub fn stopping() -> bool {
         false
@@ -236,7 +362,7 @@ mod group {
     pub struct Group(HANDLE);
 
     pub fn spawn(command: &mut Command) -> std::io::Result<(Child, Group)> {
-        let child = command.spawn()?;
+        let child = command.creation_flags(CREATE_NO_WINDOW).spawn()?;
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -274,7 +400,7 @@ fn version(version: &str) -> Vec<u64> {
 
 /// Downloads `release`'s archive of `name` for this machine, checks it against its digest, and puts `exes` from it into
 /// `bin`.
-fn install(release: &Release, name: &str, exes: &[&str], bin: &Path) -> Result<()> {
+fn fetch(release: &Release, name: &str, exes: &[&str], bin: &Path) -> Result<()> {
     let dir = format!("{name}-{}-{}", release.tag_name, target()?);
     let file = format!("{dir}.{}", if cfg!(windows) { "zip" } else { "tar.gz" });
     let asset = release.assets.iter().find(|a| a.name == file).with_context(|| format!("{name} {} has no {file}", release.tag_name))?;
