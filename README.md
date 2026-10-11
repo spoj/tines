@@ -11,6 +11,15 @@ Download your platform's archive from the [latest release](https://github.com/sp
 `tines update` from it. It installs tines and letmeknow, the latest 0.14.x, into `~/.tines/bin`; run it again to update
 them.
 
+## The Pi extension
+
+    pi install git:github.com/spoj/tines
+
+It puts every interactive Pi session in letmeknow as the session `pi-<end of its Pi session id>`, which its status line
+shows. What letmeknow prints for the session reaches the agent as a message that starts a turn, and the session is
+removed when the Pi session ends in no group. `--letmeknow <handle>` puts a session of any mode in letmeknow as that
+session, kept when it ends. It runs `~/.tines/bin/letmeknow`, so run `tines update` first.
+
 ## Commands
 
 - `tines update`: installs or updates letmeknow and tines in `~/.tines/bin`, checking each download against the digest

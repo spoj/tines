@@ -1,0 +1,29 @@
+{
+  "name": "tines",
+  "version": "0.1.0",
+  "description": "Your agents on every machine, one pack, through letmeknow",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spoj/tines.git"
+  },
+  "pi": {
+    "extensions": ["./extensions/letmeknow.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.0.4",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3"
+  }
+}
