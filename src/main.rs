@@ -217,31 +217,42 @@ mod service {
     }
 }
 
-/// A scheduled task that starts when the user logs in. It takes the user's own PATH, not this command's.
+/// A program of the user's that Windows runs when the user logs in (the Run key), which needs no administrator. It takes
+/// the user's own PATH, not this command's.
 #[cfg(windows)]
 mod service {
+    use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
 
     use anyhow::Result;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    const RUN: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
     pub fn install(tines: &Path, _path: &str) -> Result<()> {
-        let task = format!("\"{}\" keep", tines.display());
-        super::run(Command::new("schtasks").args(["/Create", "/F", "/TN", "tines", "/SC", "ONLOGON", "/TR", &task]))?;
-        super::run(Command::new("schtasks").args(["/Run", "/TN", "tines"]))
+        stop();
+        super::run(Command::new("reg").args(["add", RUN, "/v", "tines", "/t", "REG_SZ", "/f", "/d"]).arg(format!("\"{}\" keep", tines.display())))?;
+        Command::new(tines).arg("keep").creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn()?;
+        Ok(())
     }
 
     pub fn uninstall() -> Result<()> {
-        // A task that does not run makes /End fail, which is fine.
-        let _ = Command::new("schtasks").args(["/End", "/TN", "tines"]).output();
-        super::run(Command::new("schtasks").args(["/Delete", "/F", "/TN", "tines"]))
+        stop();
+        super::run(Command::new("reg").args(["delete", RUN, "/v", "tines", "/f"]))
+    }
+
+    /// Ends the running keeper, if one runs, which ends its Pi: every tines but this one.
+    fn stop() {
+        let others = format!("PID ne {}", std::process::id());
+        let _ = Command::new("taskkill").args(["/F", "/FI", "IMAGENAME eq tines.exe", "/FI", &others]).output();
     }
 }
 
 /// Runs Pi until it ends, then ends what it left running; how it ended, or None if tines was told to stop meanwhile.
 fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
     let errors = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
-    let mut command = Command::new("pi");
+    let mut command = group::pi();
     command.args(["--mode", "rpc", "--letmeknow", "tine"]).current_dir(dir);
     // RPC mode ends when its input does: the keeper holds it open, and writes nothing.
     command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
@@ -308,6 +319,10 @@ mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
+    pub fn pi() -> Command {
+        Command::new("pi")
+    }
+
     pub struct Group(libc::pid_t);
 
     pub fn spawn(command: &mut Command) -> std::io::Result<(Child, Group)> {
@@ -357,6 +372,13 @@ mod group {
 
     pub fn stopping() -> bool {
         false
+    }
+
+    /// Pi is a batch file, pi.cmd, which cmd finds and runs.
+    pub fn pi() -> Command {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "pi"]);
+        command
     }
 
     pub struct Group(HANDLE);
