@@ -24,3 +24,9 @@ session, kept when it ends. It runs `~/.tines/bin/letmeknow`, so run `tines upda
 
 - `tines update`: installs or updates letmeknow and tines in `~/.tines/bin`, checking each download against the digest
   its GitHub release lists. It needs `curl` and `tar`, which macOS, Linux and Windows 10 and later have.
+- `tines keep`: keeps this machine's tine, `pi --mode rpc --letmeknow tine` working in `~/.tines/tine`, which needs the
+  extension. When Pi ends, so does everything it started, and Pi starts again with a fresh context: after 2 s, or after
+  longer waits, up to a minute, while it keeps ending within a minute of starting. Before each start, tines runs itself
+  anew if `tines update` replaced it. It logs to `~/.tines/keep.log`, with what Pi writes to stderr.
+
+A tine updates itself: it runs `pi update` and `tines update`, then ends its Pi, which the keeper starts again.

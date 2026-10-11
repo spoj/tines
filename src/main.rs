@@ -1,7 +1,10 @@
 //! tines: your agents on every machine, one pack, through letmeknow. See README.md.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -9,6 +12,17 @@ use sha2::{Digest, Sha256};
 
 /// The letmeknow minor version that tines installs, and that its extension's sessions speak.
 const LETMEKNOW: &str = "0.14";
+
+/// How soon Pi starts again after it ends; each further run shorter than STEADY doubles it, up to LONGEST_WAIT.
+const FIRST_WAIT: Duration = Duration::from_secs(2);
+const LONGEST_WAIT: Duration = Duration::from_secs(60);
+const STEADY: Duration = Duration::from_secs(60);
+
+/// How often the keeper looks whether Pi ended, or whether it was told to stop.
+const POLL: Duration = Duration::from_millis(250);
+
+/// The size past which `keep.log` is moved aside to `keep.log.old` before Pi starts.
+const LOG_LIMIT: u64 = 1 << 20;
 
 /// What letmeknow's release archives hold.
 const LETMEKNOW_EXES: [&str; 4] = ["letmeknow", "letmeknow-kind-doc", "letmeknow-kind-git", "git-remote-lmk"];
@@ -31,7 +45,8 @@ struct Asset {
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("update") => update(),
-        _ => bail!("usage: tines update"),
+        Some("keep") => keep(),
+        _ => bail!("usage: tines update | keep"),
     }
 }
 
@@ -69,6 +84,181 @@ fn update() -> Result<()> {
         println!("tines {running} is current");
     }
     Ok(())
+}
+
+/// Keeps this machine's tine: Pi in RPC mode, in letmeknow as the session `tine`, working in `~/.tines/tine`. When Pi
+/// ends, the processes it started end too, and Pi starts again with a fresh context. Before each start, tines runs itself
+/// anew if `tines update` replaced it. What happens, and what Pi writes to stderr, goes to `~/.tines/keep.log`.
+fn keep() -> Result<()> {
+    let home = home()?;
+    let dir = home.join("tine");
+    std::fs::create_dir_all(&dir)?;
+    let me = std::env::current_exe()?;
+    let built = std::fs::metadata(&me)?.modified()?;
+    group::stop_on_signals();
+    let mut short: u32 = 0;
+    loop {
+        if std::fs::metadata(&me)?.modified()? != built {
+            log(&home, "tines was updated: running it anew")?;
+            return renew(&me);
+        }
+        if std::fs::metadata(home.join("keep.log")).is_ok_and(|log| log.len() > LOG_LIMIT) {
+            std::fs::rename(home.join("keep.log"), home.join("keep.log.old"))?;
+        }
+        log(&home, "starting pi")?;
+        let started = Instant::now();
+        let Some(ended) = run_pi(&home, &dir)? else { return log(&home, "stopped") };
+        short = if started.elapsed() < STEADY { short + 1 } else { 0 };
+        let wait = LONGEST_WAIT.min(FIRST_WAIT * 2u32.pow(short.saturating_sub(1).min(5)));
+        log(&home, &format!("{ended}; starting it again in {} s", wait.as_secs()))?;
+        let asleep = Instant::now();
+        while asleep.elapsed() < wait && !group::stopping() {
+            std::thread::sleep(POLL);
+        }
+        if group::stopping() {
+            return log(&home, "stopped");
+        }
+    }
+}
+
+/// Runs Pi until it ends, then ends what it left running; how it ended, or None if tines was told to stop meanwhile.
+fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
+    let errors = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
+    let mut command = Command::new("pi");
+    command.args(["--mode", "rpc", "--letmeknow", "tine"]).current_dir(dir);
+    // RPC mode ends when its input does: the keeper holds it open, and writes nothing.
+    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
+    let (mut pi, group) = match group::spawn(&mut command) {
+        Ok(spawned) => spawned,
+        Err(error) => return Ok(Some(format!("pi did not start: {error}"))),
+    };
+    let status = loop {
+        if let Some(status) = pi.try_wait()? {
+            break Some(status);
+        }
+        if group::stopping() {
+            break None;
+        }
+        std::thread::sleep(POLL);
+    };
+    group.end(&mut pi);
+    Ok(status.map(|status| format!("pi ended ({status})")))
+}
+
+/// Runs `me`, which `tines update` replaced, in place of this tines, with the same arguments.
+fn renew(me: &Path) -> Result<()> {
+    let mut command = Command::new(me);
+    command.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    return Err(std::os::unix::process::CommandExt::exec(&mut command).into());
+    #[cfg(windows)]
+    {
+        command.spawn()?;
+        Ok(())
+    }
+}
+
+fn log(home: &Path, text: &str) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
+    Ok(writeln!(file, "{} {text}", humantime::format_rfc3339_seconds(SystemTime::now()))?)
+}
+
+/// Pi's processes, which end together: a process group of their own.
+#[cfg(unix)]
+mod group {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// How long Pi's processes have to end once asked to, before they are killed.
+    const GRACE: Duration = Duration::from_secs(5);
+
+    static STOPPING: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn stop(_: libc::c_int) {
+        STOPPING.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on SIGTERM, SIGINT and SIGHUP tell the keeper to stop, which it does once it ended Pi's processes.
+    pub fn stop_on_signals() {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            unsafe { libc::signal(signal, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+        }
+    }
+
+    pub fn stopping() -> bool {
+        STOPPING.load(Ordering::SeqCst)
+    }
+
+    pub struct Group(libc::pid_t);
+
+    pub fn spawn(command: &mut Command) -> std::io::Result<(Child, Group)> {
+        let child = command.process_group(0).spawn()?;
+        let id = child.id() as libc::pid_t;
+        Ok((child, Group(id)))
+    }
+
+    impl Group {
+        /// Asks every process of the group to end, Pi too if it still runs, and kills those left after GRACE.
+        pub fn end(self, pi: &mut Child) {
+            unsafe { libc::kill(-self.0, libc::SIGTERM) };
+            let asked = Instant::now();
+            // Pi counts until it is reaped.
+            while unsafe { libc::kill(-self.0, 0) } == 0 && asked.elapsed() < GRACE {
+                let _ = pi.try_wait();
+                std::thread::sleep(super::POLL);
+            }
+            unsafe { libc::kill(-self.0, libc::SIGKILL) };
+            let _ = pi.wait();
+        }
+    }
+}
+
+/// Pi's processes, which end together: a job, which ends them all once closed. Windows ends a process without telling
+/// it, so the keeper is never told to stop; its job handle closes as it ends, which ends Pi's.
+#[cfg(windows)]
+mod group {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    pub fn stop_on_signals() {}
+
+    pub fn stopping() -> bool {
+        false
+    }
+
+    pub struct Group(HANDLE);
+
+    pub fn spawn(command: &mut Command) -> std::io::Result<(Child, Group)> {
+        let child = command.spawn()?;
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let size = std::mem::size_of_val(&limits) as u32;
+            if job.is_null()
+                || SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size) == 0
+                || AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((child, Group(job)))
+        }
+    }
+
+    impl Group {
+        /// Ends every process of the job, Pi too if it still runs.
+        pub fn end(self, pi: &mut Child) {
+            unsafe { CloseHandle(self.0) };
+            let _ = pi.wait();
+        }
+    }
 }
 
 /// The newest release, neither draft nor prerelease, of the minor version `minor`.
