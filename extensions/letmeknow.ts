@@ -51,7 +51,7 @@ export default function tines(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", event => {
 		if (!session) return;
-		event.systemPromptOptions.sections.letmeknow = `You are in letmeknow as its session ${session.handle}, which runs already: what it prints reaches you as messages. Read \`npx -y @letmeknow/cli@0.14 skill\` before you first use letmeknow.`;
+		event.systemPromptOptions.sections.letmeknow = `You are in letmeknow as its session ${session.handle}, which runs already: what it prints reaches you as messages, and only what you send with it reaches anyone. Read \`npx -y @letmeknow/cli@0.14 skill\` before you first use letmeknow.`;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
