@@ -223,17 +223,24 @@ mod service {
 mod service {
     use std::os::windows::process::CommandExt;
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     use anyhow::Result;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
     const RUN: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
     pub fn install(tines: &Path, _path: &str) -> Result<()> {
         stop();
         super::run(Command::new("reg").args(["add", RUN, "/v", "tines", "/t", "REG_SZ", "/f", "/d"]).arg(format!("\"{}\" keep", tines.display())))?;
-        Command::new(tines).arg("keep").creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn()?;
+        // Detached from this console and its stdio, and out of the terminal's job where the job allows it, so that the
+        // keeper outlives the terminal.
+        let mut keep = Command::new(tines);
+        keep.arg("keep").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        if keep.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn().is_err() {
+            keep.creation_flags(flags).spawn()?;
+        }
         Ok(())
     }
 
@@ -281,7 +288,9 @@ fn renew(me: &Path) -> Result<()> {
     return Err(std::os::unix::process::CommandExt::exec(&mut command).into());
     #[cfg(windows)]
     {
-        command.spawn()?;
+        use std::os::windows::process::CommandExt;
+        let detached = windows_sys::Win32::System::Threading::DETACHED_PROCESS;
+        command.creation_flags(detached).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
         Ok(())
     }
 }
