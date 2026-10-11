@@ -226,6 +226,8 @@ mod service {
     use std::process::{Command, Stdio};
 
     use anyhow::Result;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
     use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
     const RUN: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -234,7 +236,11 @@ mod service {
         stop();
         super::run(Command::new("reg").args(["add", RUN, "/v", "tines", "/t", "REG_SZ", "/f", "/d"]).arg(format!("\"{}\" keep", tines.display())))?;
         // Detached from this console and its stdio, and out of the terminal's job where the job allows it, so that the
-        // keeper outlives the terminal.
+        // keeper outlives the terminal. Windows hands a child every inheritable handle, and a pipe reading this command's
+        // output would stay open while the keeper runs, so this command's own stdio is no longer inheritable.
+        for handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe { SetHandleInformation(GetStdHandle(handle), HANDLE_FLAG_INHERIT, 0) };
+        }
         let mut keep = Command::new(tines);
         keep.arg("keep").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
