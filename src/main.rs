@@ -423,7 +423,10 @@ fn fetch(release: &Release, bin: &Path) -> Result<()> {
     run(Command::new("curl").arg("-fsSLo").arg(&archive).arg(&asset.browser_download_url))?;
     let digest = format!("sha256:{:x}", Sha256::digest(std::fs::read(&archive)?));
     ensure!(digest == asset.digest, "{file} does not match its release's digest");
-    run(Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&tmp))?;
+    // Windows' own tar, which reads zip, though Git for Windows puts its GNU tar first on PATH; by a relative name, which
+    // GNU tar would take for a remote host for its `C:`.
+    let tar = if cfg!(windows) { PathBuf::from(std::env::var("SystemRoot")?).join(r"System32\tar.exe") } else { PathBuf::from("tar") };
+    run(Command::new(tar).arg("-xf").arg(&file).current_dir(&tmp))?;
     let (new, dest) = (tmp.join(&dir).join(exe("tines")), bin.join(exe("tines")));
     // Windows cannot overwrite a program that runs, but can move it aside.
     if cfg!(windows) && dest.exists() {
