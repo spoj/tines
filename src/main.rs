@@ -1,4 +1,4 @@
-//! tines: keeps a Pi running on a machine, always. See README.md.
+//! tines: keeps one program running on a machine, always. See README.md.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -10,15 +10,15 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// How soon Pi starts again after it ends; each further run shorter than STEADY doubles it, up to LONGEST_WAIT.
+/// How soon the tine starts again after it ends; each further run shorter than STEADY doubles it, up to LONGEST_WAIT.
 const FIRST_WAIT: Duration = Duration::from_secs(2);
 const LONGEST_WAIT: Duration = Duration::from_secs(60);
 const STEADY: Duration = Duration::from_secs(60);
 
-/// How often the keeper looks whether Pi ended, or whether it was told to stop.
+/// How often the keeper looks whether the tine ended, or whether it was told to stop.
 const POLL: Duration = Duration::from_millis(250);
 
-/// The size past which `keep.log` is moved aside to `keep.log.old` before Pi starts.
+/// The size past which `keep.log` is moved aside to `keep.log.old` before the tine starts.
 const LOG_LIMIT: u64 = 1 << 20;
 
 #[derive(Deserialize)]
@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         Some("install") => install(),
         Some("uninstall") => service::uninstall(),
         Some("keep") => keep(),
-        _ => bail!("usage: tines update | install | uninstall | keep"),
+        _ => bail!("usage: tines update | install <command> | uninstall | keep"),
     }
 }
 
@@ -68,10 +68,10 @@ fn update() -> Result<()> {
     Ok(())
 }
 
-/// Keeps this machine's tine: Pi in RPC mode, as the session named `tine` with pi-letmeknow, which puts it in letmeknow
-/// as `tine`, working in `~/.tines/tine`. When Pi ends, the processes it started end too, and Pi starts again with a
-/// fresh context. Before each start, tines runs itself anew if `tines update` replaced it. What happens, and what Pi
-/// writes to stderr, goes to `~/.tines/keep.log`.
+/// Keeps this machine's tine: the command `tines install` saved, read anew before each start, which the system's shell
+/// runs in `~/.tines/tine`. When the tine ends, the processes it started end too, and it starts again. Before each
+/// start, tines runs itself anew if `tines update` replaced it. What happens, and what the tine writes to stderr, goes to
+/// `~/.tines/keep.log`.
 fn keep() -> Result<()> {
     let home = home()?;
     let dir = home.join("tine");
@@ -88,9 +88,11 @@ fn keep() -> Result<()> {
         if std::fs::metadata(home.join("keep.log")).is_ok_and(|log| log.len() > LOG_LIMIT) {
             std::fs::rename(home.join("keep.log"), home.join("keep.log.old"))?;
         }
-        log(&home, "starting pi")?;
+        let command = std::fs::read_to_string(home.join("command")).context("no command: run tines install <command>")?;
+        let command = command.trim();
+        log(&home, &format!("starting the tine: {command}"))?;
         let started = Instant::now();
-        let Some(ended) = run_pi(&home, &dir)? else { return log(&home, "stopped") };
+        let Some(ended) = run_tine(&home, &dir, command)? else { return log(&home, "stopped") };
         short = if started.elapsed() < STEADY { short + 1 } else { 0 };
         let wait = LONGEST_WAIT.min(FIRST_WAIT * 2u32.pow(short.saturating_sub(1).min(5)));
         log(&home, &format!("{ended}; starting it again in {} s", wait.as_secs()))?;
@@ -104,11 +106,15 @@ fn keep() -> Result<()> {
     }
 }
 
-/// Has the system run `tines keep` from `~/.tines/bin` from now on, and again after it restarts, with the PATH this
-/// command runs with, which Pi and its tools need.
+/// Saves its arguments, joined by spaces, as the command of this machine's tine, and has the system run `tines keep` from
+/// `~/.tines/bin` from now on, and again after it restarts, with the PATH this command runs with, which the tine needs.
 fn install() -> Result<()> {
-    let tines = home()?.join("bin").join(exe("tines"));
+    let home = home()?;
+    let tines = home.join("bin").join(exe("tines"));
     ensure!(tines.exists(), "{} does not exist: run tines update first", tines.display());
+    let command = std::env::args().skip(2).collect::<Vec<_>>().join(" ");
+    ensure!(!command.is_empty(), "usage: tines install <command>");
+    std::fs::write(home.join("command"), command)?;
     service::install(&tines, &std::env::var("PATH")?)
 }
 
@@ -236,26 +242,25 @@ mod service {
         super::run(Command::new("reg").args(["delete", RUN, "/v", "tines", "/f"]))
     }
 
-    /// Ends the running keeper, if one runs, which ends its Pi: every tines but this one.
+    /// Ends the running keeper, if one runs, which ends its tine: every tines but this one.
     fn stop() {
         let others = format!("PID ne {}", std::process::id());
         let _ = Command::new("taskkill").args(["/F", "/FI", "IMAGENAME eq tines.exe", "/FI", &others]).output();
     }
 }
 
-/// Runs Pi until it ends, then ends what it left running; how it ended, or None if tines was told to stop meanwhile.
-fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
+/// Runs the tine until it ends, then ends what it left running; how it ended, or None if tines was told to stop meanwhile.
+fn run_tine(home: &Path, dir: &Path, command: &str) -> Result<Option<String>> {
     let errors = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
-    let mut command = group::pi();
-    command.args(["--mode", "rpc", "--name", "tine", "-e", "git:github.com/spoj/pi-letmeknow"]).current_dir(dir);
-    // RPC mode ends when its input does: the keeper holds it open, and writes nothing.
-    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
-    let (mut pi, group) = match group::spawn(&mut command) {
+    let mut shell = group::shell(command);
+    // Its input stays open, and empty: some programs end when their input does, Pi in RPC mode among them.
+    shell.current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
+    let (mut tine, group) = match group::spawn(&mut shell) {
         Ok(spawned) => spawned,
-        Err(error) => return Ok(Some(format!("pi did not start: {error}"))),
+        Err(error) => return Ok(Some(format!("the tine did not start: {error}"))),
     };
     let status = loop {
-        if let Some(status) = pi.try_wait()? {
+        if let Some(status) = tine.try_wait()? {
             break Some(status);
         }
         if group::stopping() {
@@ -263,8 +268,8 @@ fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
         }
         std::thread::sleep(POLL);
     };
-    group.end(&mut pi);
-    Ok(status.map(|status| format!("pi ended ({status})")))
+    group.end(&mut tine);
+    Ok(status.map(|status| format!("the tine ended ({status})")))
 }
 
 /// Runs `me`, which `tines update` replaced, in place of this tines, with the same arguments.
@@ -287,7 +292,7 @@ fn log(home: &Path, text: &str) -> Result<()> {
     Ok(writeln!(file, "{} {text}", humantime::format_rfc3339_seconds(SystemTime::now()))?)
 }
 
-/// Pi's processes, which end together: a process group of their own.
+/// The tine's processes, which end together: a process group of their own.
 #[cfg(unix)]
 mod group {
     use std::os::unix::process::CommandExt;
@@ -295,7 +300,7 @@ mod group {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    /// How long Pi's processes have to end once asked to, before they are killed.
+    /// How long the tine's processes have to end once asked to, before they are killed.
     const GRACE: Duration = Duration::from_secs(5);
 
     static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -304,7 +309,7 @@ mod group {
         STOPPING.store(true, Ordering::SeqCst);
     }
 
-    /// From now on SIGTERM, SIGINT and SIGHUP tell the keeper to stop, which it does once it ended Pi's processes.
+    /// From now on SIGTERM, SIGINT and SIGHUP tell the keeper to stop, which it does once it ended the tine's processes.
     pub fn init() {
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             unsafe { libc::signal(signal, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
@@ -315,8 +320,10 @@ mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
-    pub fn pi() -> Command {
-        Command::new("pi")
+    pub fn shell(command: &str) -> Command {
+        let mut shell = Command::new("sh");
+        shell.args(["-c", command]);
+        shell
     }
 
     pub struct Group(libc::pid_t);
@@ -328,23 +335,23 @@ mod group {
     }
 
     impl Group {
-        /// Asks every process of the group to end, Pi too if it still runs, and kills those left after GRACE.
-        pub fn end(self, pi: &mut Child) {
+        /// Asks every process of the group to end, the tine too if it still runs, and kills those left after GRACE.
+        pub fn end(self, tine: &mut Child) {
             unsafe { libc::kill(-self.0, libc::SIGTERM) };
             let asked = Instant::now();
-            // Pi counts until it is reaped.
+            // The tine counts until it is reaped.
             while unsafe { libc::kill(-self.0, 0) } == 0 && asked.elapsed() < GRACE {
-                let _ = pi.try_wait();
+                let _ = tine.try_wait();
                 std::thread::sleep(super::POLL);
             }
             unsafe { libc::kill(-self.0, libc::SIGKILL) };
-            let _ = pi.wait();
+            let _ = tine.wait();
         }
     }
 }
 
-/// Pi's processes, which end together: a job, which ends them all once closed. Windows ends a process without telling
-/// it, so the keeper is never told to stop; its job handle closes as it ends, which ends Pi's.
+/// The tine's processes, which end together: a job, which ends them all once closed. Windows ends a process without
+/// telling it, so the keeper is never told to stop; its job handle closes as it ends, which ends the tine's.
 #[cfg(windows)]
 mod group {
     use std::os::windows::io::AsRawHandle;
@@ -371,11 +378,11 @@ mod group {
         false
     }
 
-    /// Pi is a batch file, pi.cmd, which cmd finds and runs.
-    pub fn pi() -> Command {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "pi"]);
-        command
+    /// cmd runs the command as typed, finding batch files such as npm's shims too; /S takes off only the quotes around it.
+    pub fn shell(command: &str) -> Command {
+        let mut shell = Command::new("cmd");
+        shell.raw_arg(format!("/S /C \"{command}\""));
+        shell
     }
 
     pub struct Group(HANDLE);
@@ -398,10 +405,10 @@ mod group {
     }
 
     impl Group {
-        /// Ends every process of the job, Pi too if it still runs.
-        pub fn end(self, pi: &mut Child) {
+        /// Ends every process of the job, the tine too if it still runs.
+        pub fn end(self, tine: &mut Child) {
             unsafe { CloseHandle(self.0) };
-            let _ = pi.wait();
+            let _ = tine.wait();
         }
     }
 }
