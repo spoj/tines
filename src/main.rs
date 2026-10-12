@@ -69,9 +69,9 @@ fn update() -> Result<()> {
 }
 
 /// Keeps this machine's tine: Pi in RPC mode, as the session named `tine` with pi-letmeknow, which puts it in letmeknow
-/// as `tine`, working in `~/.tines/tine`. When Pi
-/// ends, the processes it started end too, and Pi starts again with a fresh context. Before each start, tines runs itself
-/// anew if `tines update` replaced it. What happens, and what Pi writes to stderr, goes to `~/.tines/keep.log`.
+/// as `tine`, working in `~/.tines/tine`. When Pi ends, the processes it started end too, and Pi starts again with a
+/// fresh context. Before each start, tines runs itself anew if `tines update` replaced it. What happens, and what Pi
+/// writes to stderr, goes to `~/.tines/keep.log`.
 fn keep() -> Result<()> {
     let home = home()?;
     let dir = home.join("tine");
@@ -358,7 +358,8 @@ mod group {
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
-    /// Lets go of a console that is the keeper's alone, as the scheduled task gives it, which closes its window.
+    /// Lets go of a console that is the keeper's alone, as Windows gives it when it runs the keeper at login, which closes
+    /// its window.
     pub fn init() {
         let mut processes = [0u32; 2];
         if unsafe { GetConsoleProcessList(processes.as_mut_ptr(), 2) } == 1 {
