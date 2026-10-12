@@ -1,6 +1,6 @@
 [package]
 name = "tines"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Keeps one program running on a machine, always"
