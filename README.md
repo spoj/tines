@@ -22,8 +22,9 @@ Named for Vernor Vinge's Tines, packs of bodies that think as one mind over soun
 - `tines keep`: keeps this machine's tine: the saved command, read anew at each start, which `sh`, or `cmd` on
   Windows, runs in `~/.tines/tine`. Its input stays open and empty, for programs that end with their input, such as Pi
   in RPC mode. When the tine ends, so does everything it started, and it starts again: after 2 s, or after longer waits,
-  up to a minute, while it keeps ending within a minute of starting. Before each start, tines runs itself anew if
-  `tines update` replaced it. It logs to `~/.tines/keep.log`, with what the tine writes to stderr.
+  up to a minute, while it keeps ending within a minute of starting. One keeper at a time keeps a machine's tine:
+  another waits until that one ends. Before each start, tines runs itself anew if `tines update` replaced it. It logs
+  to `~/.tines/keep.log`, with what the tine writes to stderr.
 
 ## A Pi as the tine
 

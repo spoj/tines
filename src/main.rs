@@ -69,9 +69,9 @@ fn update() -> Result<()> {
 }
 
 /// Keeps this machine's tine: the command `tines install` saved, read anew before each start, which the system's shell
-/// runs in `~/.tines/tine`. When the tine ends, the processes it started end too, and it starts again. Before each
-/// start, tines runs itself anew if `tines update` replaced it. What happens, and what the tine writes to stderr, goes to
-/// `~/.tines/keep.log`.
+/// runs in `~/.tines/tine`. When the tine ends, the processes it started end too, and it starts again. One keeper at a
+/// time keeps it: another waits until that one ends. Before each start, tines runs itself anew if `tines update` replaced
+/// it. What happens, and what the tine writes to stderr, goes to `~/.tines/keep.log`.
 fn keep() -> Result<()> {
     let home = home()?;
     let dir = home.join("tine");
@@ -79,6 +79,8 @@ fn keep() -> Result<()> {
     let me = std::env::current_exe()?;
     let built = std::fs::metadata(&me)?.modified()?;
     group::init();
+    let lock = OpenOptions::new().create(true).write(true).truncate(false).open(home.join("keep.lock"))?;
+    lock.lock()?;
     let mut short: u32 = 0;
     loop {
         if std::fs::metadata(&me)?.modified()? != built {
