@@ -39,7 +39,10 @@ fn main() -> Result<()> {
         Some("update") => update(),
         Some("install") => install(),
         Some("uninstall") => service::uninstall(),
-        Some("keep") => keep(),
+        // The keeper runs without a terminal, so what ends it goes to its log.
+        Some("keep") => keep().inspect_err(|error| {
+            let _ = home().and_then(|home| log(&home, &format!("tines ended: {error:#}")));
+        }),
         _ => bail!("usage: tines update | install <command> | uninstall | keep"),
     }
 }
