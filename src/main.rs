@@ -1,4 +1,4 @@
-//! tines: your agents on every machine, one pack, through letmeknow. See README.md.
+//! tines: keeps a Pi running on a machine, always. See README.md.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -9,9 +9,6 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-
-/// The letmeknow minor version that tines installs, and that its extension's sessions speak.
-const LETMEKNOW: &str = "0.14";
 
 /// How soon Pi starts again after it ends; each further run shorter than STEADY doubles it, up to LONGEST_WAIT.
 const FIRST_WAIT: Duration = Duration::from_secs(2);
@@ -24,14 +21,9 @@ const POLL: Duration = Duration::from_millis(250);
 /// The size past which `keep.log` is moved aside to `keep.log.old` before Pi starts.
 const LOG_LIMIT: u64 = 1 << 20;
 
-/// What letmeknow's release archives hold.
-const LETMEKNOW_EXES: [&str; 4] = ["letmeknow", "letmeknow-kind-doc", "letmeknow-kind-git", "git-remote-lmk"];
-
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
-    draft: bool,
-    prerelease: bool,
     assets: Vec<Asset>,
 }
 
@@ -52,7 +44,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// Installs or updates letmeknow's latest release of its minor version, then tines itself, into `~/.tines/bin`.
+/// Installs or updates tines in `~/.tines/bin`.
 fn update() -> Result<()> {
     let bin = home()?.join("bin");
     std::fs::create_dir_all(&bin)?;
@@ -64,23 +56,11 @@ fn update() -> Result<()> {
         }
     }
 
-    let releases: Vec<Release> = get("https://api.github.com/repos/spoj/letmeknow/releases?per_page=100")?;
-    let release = newest(releases, LETMEKNOW).with_context(|| format!("letmeknow has no {LETMEKNOW} release"))?;
-    let installed = Command::new(bin.join(exe("letmeknow"))).arg("--version").output().ok();
-    let installed = installed.map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_start_matches("letmeknow ").to_owned());
-    let latest = &release.tag_name[1..];
-    if installed.as_deref() == Some(latest) {
-        println!("letmeknow {latest} is current");
-    } else {
-        fetch(&release, "letmeknow", &LETMEKNOW_EXES, &bin)?;
-        println!("letmeknow {} → {latest}", installed.as_deref().unwrap_or("none"));
-    }
-
     let release: Release = get("https://api.github.com/repos/spoj/tines/releases/latest")?;
     let running = env!("CARGO_PKG_VERSION");
     let latest = &release.tag_name[1..];
     if version(latest) > version(running) || !bin.join(exe("tines")).exists() {
-        fetch(&release, "tines", &["tines"], &bin)?;
+        fetch(&release, &bin)?;
         println!("tines {running} → {latest}");
     } else {
         println!("tines {running} is current");
@@ -88,7 +68,7 @@ fn update() -> Result<()> {
     Ok(())
 }
 
-/// Keeps this machine's tine: Pi in RPC mode, in letmeknow as the session `tine`, working in `~/.tines/tine`. When Pi
+/// Keeps this machine's tine: Pi in RPC mode, as the session named `tine`, working in `~/.tines/tine`. When Pi
 /// ends, the processes it started end too, and Pi starts again with a fresh context. Before each start, tines runs itself
 /// anew if `tines update` replaced it. What happens, and what Pi writes to stderr, goes to `~/.tines/keep.log`.
 fn keep() -> Result<()> {
@@ -266,7 +246,7 @@ mod service {
 fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
     let errors = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
     let mut command = group::pi();
-    command.args(["--mode", "rpc", "--letmeknow", "tine"]).current_dir(dir);
+    command.args(["--mode", "rpc", "--name", "tine"]).current_dir(dir);
     // RPC mode ends when its input does: the keeper holds it open, and writes nothing.
     command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
     let (mut pi, group) = match group::spawn(&mut command) {
@@ -424,23 +404,16 @@ mod group {
     }
 }
 
-/// The newest release, neither draft nor prerelease, of the minor version `minor`.
-fn newest(releases: Vec<Release>, minor: &str) -> Option<Release> {
-    let prefix = format!("v{minor}.");
-    releases.into_iter().filter(|r| !r.draft && !r.prerelease && r.tag_name.starts_with(&prefix)).max_by_key(|r| version(&r.tag_name[1..]))
-}
-
 /// A version's numbers, to compare.
 fn version(version: &str) -> Vec<u64> {
     version.split('.').map(|n| n.parse().unwrap_or(0)).collect()
 }
 
-/// Downloads `release`'s archive of `name` for this machine, checks it against its digest, and puts `exes` from it into
-/// `bin`.
-fn fetch(release: &Release, name: &str, exes: &[&str], bin: &Path) -> Result<()> {
-    let dir = format!("{name}-{}-{}", release.tag_name, target()?);
+/// Downloads `release`'s archive for this machine, checks it against its digest, and puts its tines into `bin`.
+fn fetch(release: &Release, bin: &Path) -> Result<()> {
+    let dir = format!("tines-{}-{}", release.tag_name, target()?);
     let file = format!("{dir}.{}", if cfg!(windows) { "zip" } else { "tar.gz" });
-    let asset = release.assets.iter().find(|a| a.name == file).with_context(|| format!("{name} {} has no {file}", release.tag_name))?;
+    let asset = release.assets.iter().find(|a| a.name == file).with_context(|| format!("tines {} has no {file}", release.tag_name))?;
     let tmp = bin.with_file_name("tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
@@ -449,15 +422,13 @@ fn fetch(release: &Release, name: &str, exes: &[&str], bin: &Path) -> Result<()>
     let digest = format!("sha256:{:x}", Sha256::digest(std::fs::read(&archive)?));
     ensure!(digest == asset.digest, "{file} does not match its release's digest");
     run(Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&tmp))?;
-    for name in exes {
-        let (new, dest) = (tmp.join(&dir).join(exe(name)), bin.join(exe(name)));
-        // Windows cannot overwrite a program that runs, but can move it aside.
-        if cfg!(windows) && dest.exists() {
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-            std::fs::rename(&dest, dest.with_extension(format!("{stamp}.old")))?;
-        }
-        std::fs::rename(new, dest)?;
+    let (new, dest) = (tmp.join(&dir).join(exe("tines")), bin.join(exe("tines")));
+    // Windows cannot overwrite a program that runs, but can move it aside.
+    if cfg!(windows) && dest.exists() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+        std::fs::rename(&dest, dest.with_extension(format!("{stamp}.old")))?;
     }
+    std::fs::rename(new, dest)?;
     Ok(std::fs::remove_dir_all(&tmp)?)
 }
 
@@ -493,16 +464,4 @@ fn run(command: &mut Command) -> Result<()> {
     let output = command.output().with_context(|| format!("cannot run {}", command.get_program().display()))?;
     ensure!(output.status.success(), "{}: {}", command.get_program().display(), String::from_utf8_lossy(&output.stderr).trim());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_newest_release_of_a_minor_version_counts_its_patch_as_a_number() {
-        let release = |tag: &str, prerelease| Release { tag_name: tag.into(), draft: false, prerelease, assets: Vec::new() };
-        let releases = vec![release("v0.14.9", false), release("v0.15.0", false), release("v0.14.10", false), release("v0.14.11", true)];
-        assert_eq!(newest(releases, "0.14").map(|r| r.tag_name), Some("v0.14.10".into()));
-    }
 }

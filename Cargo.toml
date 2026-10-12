@@ -3,7 +3,7 @@ name = "tines"
 version = "0.2.3"
 edition = "2024"
 license = "MIT"
-description = "Your agents on every machine, one pack, through letmeknow"
+description = "Keeps a Pi running on a machine, always"
 repository = "https://github.com/spoj/tines"
 
 [dependencies]
