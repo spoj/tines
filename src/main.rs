@@ -68,7 +68,8 @@ fn update() -> Result<()> {
     Ok(())
 }
 
-/// Keeps this machine's tine: Pi in RPC mode, as the session named `tine`, working in `~/.tines/tine`. When Pi
+/// Keeps this machine's tine: Pi in RPC mode, as the session named `tine` with pi-letmeknow, which puts it in letmeknow
+/// as `tine`, working in `~/.tines/tine`. When Pi
 /// ends, the processes it started end too, and Pi starts again with a fresh context. Before each start, tines runs itself
 /// anew if `tines update` replaced it. What happens, and what Pi writes to stderr, goes to `~/.tines/keep.log`.
 fn keep() -> Result<()> {
@@ -246,7 +247,7 @@ mod service {
 fn run_pi(home: &Path, dir: &Path) -> Result<Option<String>> {
     let errors = OpenOptions::new().create(true).append(true).open(home.join("keep.log"))?;
     let mut command = group::pi();
-    command.args(["--mode", "rpc", "--name", "tine"]).current_dir(dir);
+    command.args(["--mode", "rpc", "--name", "tine", "-e", "git:github.com/spoj/pi-letmeknow"]).current_dir(dir);
     // RPC mode ends when its input does: the keeper holds it open, and writes nothing.
     command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(errors);
     let (mut pi, group) = match group::spawn(&mut command) {
